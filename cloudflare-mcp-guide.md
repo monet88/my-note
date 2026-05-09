@@ -1,255 +1,92 @@
-# Building MCP Servers on Cloudflare Workers for ChatGPT
+# Advanced Stateless MCP Server on Cloudflare Workers (TypeScript)
 
-This guide details how to build and deploy a stateless Model Context Protocol (MCP) server on Cloudflare Workers. This approach is highly optimized for ChatGPT Custom Apps because it requires **zero dependencies**, operates with **0ms cold starts**, and fits perfectly into Cloudflare's generous free tier (100,000 requests/day).
+Guide này hướng dẫn cách xây dựng và triển khai một MCP Server chuyên nghiệp trên Cloudflare Workers. Phương pháp này sử dụng **TypeScript**, **MCP SDK chính thức**, và hỗ trợ các tính năng nâng cao như **Xoay vòng API Key (Round-Robin)**.
 
-## Overview
+## Tại sao chọn Cloudflare Workers?
+- **Stateless HTTP:** Tương thích hoàn hảo với ChatGPT Custom Apps.
+- **Tốc độ:** Cold start gần như bằng 0ms.
+- **Chi phí:** Miễn phí lên tới 100,000 requests/ngày.
+- **SDK chính thức:** Sử dụng `@modelcontextprotocol/sdk` thay vì viết code xử lý JSON-RPC thủ công.
 
-Unlike standard local MCP servers that use `stdio` (Standard I/O) or stateful Server-Sent Events (SSE), ChatGPT Custom Apps communicate via **Stateless HTTP**. 
-
-This means every interaction from ChatGPT is a simple HTTP `POST` request containing a JSON-RPC payload. We can implement this directly in a Cloudflare Worker without needing heavy SDKs.
-
-## 1. Project Setup
-
-Create a minimal directory structure:
-
-```bash
-mkdir my-mcp-server
-cd my-mcp-server
-npm init -y
-npm install -D wrangler
+## 1. Cấu trúc Project (Khuyến nghị)
+```text
+project-root/
+├── src/                # Logic cốt lõi
+│   ├── utils/          # Key Pool, Logger, Error Handler
+│   └── tools/          # Định nghĩa các Tools
+├── workers/            # Cloudflare Adapter
+│   ├── src/
+│   │   └── worker.ts   # Entry point của Worker
+│   ├── wrangler.toml   # Cấu hình Cloudflare
+│   └── tsconfig.json
+└── package.json
 ```
 
-Create a `wrangler.toml` file to configure the Cloudflare Worker:
+## 2. Triển khai Stateless Adapter (`worker.ts`)
 
-```toml
-name = "my-mcp-server"
-main = "src/worker.js"
-compatibility_date = "2025-05-01"
+Bí quyết để chạy MCP SDK trên môi trường Stateless là truy cập trực tiếp vào internal registry của server.
 
-[observability]
-enabled = true
-```
-
-## 2. The Worker Boilerplate (`src/worker.js`)
-
-This is the universal boilerplate for a stateless MCP server. You only need to modify the `TOOLS` array and the `handleToolCall` function to add your own custom logic.
-
-```javascript
-/**
- * Cloudflare Workers MCP Server Boilerplate
- * Implements MCP Stateless HTTP protocol directly.
- */
-
-// ============================================================================
-// 1. DEFINE YOUR TOOLS (JSON Schema format)
-// ============================================================================
-
-const TOOLS = [
-  {
-    name: "hello_world",
-    description: "Returns a simple greeting.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        name: {
-          type: "string",
-          description: "The name to greet",
-        },
-      },
-      required: ["name"],
-      additionalProperties: false,
-    },
-  }
-];
-
-// ============================================================================
-// 2. IMPLEMENT YOUR TOOL LOGIC
-// ============================================================================
-
-async function handleToolCall(toolName, args) {
-  switch (toolName) {
-    case "hello_world":
-      return {
-        content: [{ type: "text", text: `Hello, ${args.name}! I am running on Cloudflare Edge.` }]
-      };
-      
-    // Add more cases for other tools here...
-
-    default:
-      throw new Error(`Unknown tool: ${toolName}`);
-  }
-}
-
-// ============================================================================
-// 3. MCP JSON-RPC ROUTER (DO NOT MODIFY UNLESS NECESSARY)
-// ============================================================================
-
-async function handleMcpRequest(body) {
-  const { jsonrpc, id, method, params } = body;
-
-  if (jsonrpc !== "2.0") {
-    return { jsonrpc: "2.0", id, error: { code: -32600, message: "Invalid JSON-RPC version" } };
-  }
-
-  switch (method) {
-    case "initialize":
-      // ChatGPT sends this during the initial connection handshake
-      return {
-        jsonrpc: "2.0", id,
-        result: {
-          protocolVersion: "2025-03-26",
-          capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: "cf-worker-mcp", version: "1.0.0" },
-        },
-      };
-
-    case "notifications/initialized":
-      // Client ack \u2014 no response needed
-      return null;
-
-    case "tools/list":
-      // ChatGPT asks for available tools
-      return { jsonrpc: "2.0", id, result: { tools: TOOLS } };
-
-    case "tools/call": {
-      // ChatGPT executes a tool
-      const toolName = params?.name;
-      const args = params?.arguments || {};
-      try {
-        const result = await handleToolCall(toolName, args);
-        return { jsonrpc: "2.0", id, result };
-      } catch (err) {
-        return {
-          jsonrpc: "2.0", id,
-          result: { content: [{ type: "text", text: `Error: ${err.message}` }], isError: true },
-        };
-      }
-    }
-
-    case "ping":
-      // Health check from client
-      return { jsonrpc: "2.0", id, result: {} };
-
-    default:
-      return { jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } };
-  }
-}
-
-// ============================================================================
-// 4. CLOUDFLARE FETCH HANDLER
-// ============================================================================
-
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "POST, GET, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Accept, Mcp-Session-Id",
-    "Access-Control-Expose-Headers": "Mcp-Session-Id",
-  };
-}
+```typescript
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { initializeMcpServer, McpConfig } from '../../src/mcp-handler.js';
+import { updateKeyPool } from '../../src/utils/build-key-pool.js';
 
 export default {
-  async fetch(request) {
+  async fetch(request: Request, env: Env) {
     const url = new URL(request.url);
 
-    // Handle CORS Preflight
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders() });
-    }
+    // 1. Đồng bộ Key Pool từ Environment (Secrets)
+    const envKeys = env.EXA_API_KEYS || env.EXA_API_KEY;
+    if (envKeys) updateKeyPool(envKeys);
 
-    // Basic health check endpoint
-    if (request.method === "GET" && url.pathname === "/") {
-      return new Response("Cloudflare Workers MCP Server is running.", {
-        headers: { "Content-Type": "text/plain", ...corsHeaders() },
-      });
-    }
+    // 2. Trích xuất API Key từ Request (nếu có)
+    const requestKey = getRequestApiKey(request, url);
 
-    // Main MCP Endpoint
-    if (url.pathname === "/mcp" && request.method === "POST") {
-      let body;
-      try {
-        body = await request.json();
-      } catch {
-        return Response.json(
-          { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
-          { status: 400, headers: corsHeaders() }
-        );
-      }
+    // 3. Khởi tạo MCP Server với config
+    const config: McpConfig = {
+      exaApiKey: requestKey, // Nếu undefined, hệ thống sẽ dùng Key Pool tự động
+      userProvidedApiKey: Boolean(requestKey),
+    };
+    
+    const server = new McpServer({ name: "my-server", version: "1.0.0" });
+    initializeMcpServer(server, config);
 
-      // Handle batch requests (ChatGPT sometimes sends multiple requests in an array)
-      if (Array.isArray(body)) {
-        const responses = [];
-        for (const msg of body) {
-          const res = await handleMcpRequest(msg);
-          if (res) responses.push(res);
-        }
-        return Response.json(responses, { headers: corsHeaders() });
-      }
-
-      // Handle single request
-      const result = await handleMcpRequest(body);
-      if (!result) {
-        // Notifications don't expect a response body
-        return new Response(null, { status: 204, headers: corsHeaders() });
-      }
-      return Response.json(result, { headers: corsHeaders() });
-    }
-
-    // Handle standard SSE check (returns 405 to force stateless fallback)
-    if (url.pathname === "/mcp" && request.method === "GET") {
-      return new Response("SSE sessions not supported (stateless server)", {
-        status: 405, headers: corsHeaders(),
-      });
-    }
-
-    return new Response("Not Found", { status: 404 });
-  },
+    // 4. Xử lý JSON-RPC (Tools List & Tools Call)
+    // ... (Code xử lý router JSON-RPC)
+  }
 };
 ```
 
-## 3. Development and Testing
+## 3. Cơ chế Xoay vòng API Key (Round-Robin)
 
-Test your worker locally:
+Để tối ưu hóa rate limit, chúng ta sử dụng một `KeyPool` để quản lý danh sách API Key.
 
+### Cấu hình Secrets:
+Sử dụng `wrangler` để nạp danh sách key:
 ```bash
-npx wrangler dev --port 8787
+# Nạp chuỗi key phân cách bằng dấu phẩy
+npx wrangler secret put EXA_API_KEYS
+# Giá trị: key1,key2,key3
 ```
 
-You can simulate what ChatGPT sends using `curl`:
+### Cách hoạt động:
+- Nếu một key bị **429 (Rate Limited)**, hệ thống tự động đánh dấu cooldown và chuyển sang key tiếp theo.
+- Nếu key bị **401/403 (Invalid)**, key đó sẽ bị loại bỏ khỏi pool.
+- Việc xoay vòng giúp server hoạt động bền bỉ hơn khi có nhiều người dùng cùng lúc.
 
-**Test initialization:**
+## 4. Deploy và Thiết lập
+
+### Lệnh Deploy:
 ```bash
-curl -s -X POST http://localhost:8787/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
+npm run cf:deploy
 ```
 
-**Test a tool call:**
-```bash
-curl -s -X POST http://localhost:8787/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hello_world","arguments":{"name":"Alice"}}}'
-```
+### URL Setup trên ChatGPT:
+- **Endpoint:** `https://your-worker-name.<username>.workers.dev/mcp`
+- **Method:** POST
+- **Auth:** None (hoặc API Key qua Header `x-api-key`).
 
-## 4. Deployment
-
-Deploy to Cloudflare's global edge network:
-
-```bash
-npx wrangler deploy
-```
-
-Once deployed, you will get a URL like `https://my-mcp-server.<your-username>.workers.dev`.
-
-## 5. Connecting to ChatGPT
-
-1. In ChatGPT, navigate to **Settings** > **Apps & Connectors** > **Create**.
-2. **Name**: `Your App Name`
-3. **MCP Server URL**: `https://my-mcp-server.<your-username>.workers.dev/mcp` *(Don't forget the `/mcp` path)*
-4. **Authentication**: `None` (or configure API keys if you add custom middleware).
-5. Accept the warning and click **Create**.
-
-## Best Practices
-1. **Secrets:** If your MCP server needs API keys (e.g., calling OpenAI or a Database), store them using `wrangler secret put MY_API_KEY` and access them via the `env` parameter in your fetch handler: `async fetch(request, env)`.
-2. **Custom Domains:** You can map custom domains (like `mcp.yourdomain.com`) in the Cloudflare Dashboard under your Worker's settings > Triggers > Custom Domains.
-3. **Logs:** Use `npx wrangler tail` to monitor live incoming requests from ChatGPT if tools fail to execute.
+## 5. Mẹo nâng cao
+1. **Batch Requests:** ChatGPT đôi khi gửi nhiều yêu cầu trong một mảng JSON. Hãy đảm bảo Worker của bạn có vòng lặp xử lý mảng này.
+2. **CORS:** Luôn trả về đúng headers `Access-Control-Allow-Origin: *` để ChatGPT có thể gọi API từ trình duyệt.
+3. **Logs:** Sử dụng `npx wrangler tail` để debug các lỗi phát sinh trong thời gian thực.
